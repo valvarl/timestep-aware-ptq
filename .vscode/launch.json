@@ -1,0 +1,18 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "name": "Python: Debug Quantization Script",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"
+            }
+        }
+    ]
+}
