@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class FakeQuantLinear(nn.Module):
     """
     A linear layer that, in 'calibration' mode, collects per-timestep, per-channel
@@ -34,6 +35,7 @@ class FakeQuantLinear(nn.Module):
         # weight quantization buffers
         self.register_buffer('weight_scale',      torch.ones(out_features, dtype=torch.float32))
         self.register_buffer('weight_zero_point', torch.zeros(out_features, dtype=torch.int32))
+        self.register_buffer('weight_int',        torch.zeros_like(self.weight, dtype=torch.int8))
 
         self.act_stats   = {}  # t -> {'min': Tensor[in_features], 'max': Tensor[in_features]}
         self.act_qparams = {}  # t -> {'scale': Tensor[in_features], 'zero_point': Tensor[in_features]}
@@ -51,17 +53,28 @@ class FakeQuantLinear(nn.Module):
         """
         if isinstance(timestep, torch.Tensor):
             timestep = timestep[0].item()
+            # print(timestep)
+        
         if self.collecting:
             # per-channel stats over batch dim
             # attn.to_q(hidden_states) is [B, S, (N * D)]
             x_min = x.view(-1, x.size(-1)).min(dim=0).values  # [in_features]
             x_max = x.view(-1, x.size(-1)).max(dim=0).values  # [in_features]
-            stats = self.act_stats.setdefault(timestep, {
-                'min': x_min.clone(),
-                'max': x_max.clone()
-            })
-            stats['min'] = torch.min(stats['min'], x_min)
-            stats['max'] = torch.max(stats['max'], x_max)
+
+            if timestep not in self.act_stats:
+                self.act_stats[timestep] = {
+                    'min': x_min.clone(),
+                    'max': x_max.clone()
+                }
+            else:
+                s = self.act_stats[timestep]
+                s['min'] = torch.min(s['min'], x_min)
+                s['max'] = torch.max(s['max'], x_max)
+
+            # stats = self.act_stats.setdefault(timestep, {'min': x_min.clone(),
+            #                                               'max': x_max.clone()})
+            # stats['min'].clamp_max_(x_min)
+            # stats['max'].clamp_min_(x_max)
             # torch.save(x, "x.pt")
             # torch.save(self.weight, "weight.pt")
             # torch.save(self.bias, "bias.pt")
@@ -69,8 +82,6 @@ class FakeQuantLinear(nn.Module):
             return F.linear(x, self.weight, self.bias)
 
         # Inference path
-        if isinstance(timestep, torch.Tensor):
-            timestep = timestep[0].item()
         if timestep not in self.act_qparams:
             raise KeyError(f"No qparams for timestep={timestep}. Did you freeze()?")
 
@@ -78,6 +89,9 @@ class FakeQuantLinear(nn.Module):
         qparams = self.act_qparams[timestep]
         scale_a = qparams['scale']       # Tensor of shape [in_features]
         zp_a    = qparams['zero_point']  # Tensor of shape [in_features]
+
+        # print("SCALE", scale_a)
+        # print("ZERO", zp_a)
 
 
         # 1) quantize the re-parameterized activation
@@ -88,15 +102,28 @@ class FakeQuantLinear(nn.Module):
         # 2) dequantize activations per-channel
         #    (x_int8.float() - zp_a) is [B, in_features] minus [in_features] → [B, in_features]
         x_deq = (x_int8.float() - zp_a) * scale_a        # [B, in_features]
+        # x_deq = x
 
         # 3) dequant weights per-channel
         #    weight_zero_point: [out_features], weight_scale: [out_features]
         w_deq = (self.weight_int.float() - self.weight_zero_point[:, None]) \
                 * self.weight_scale[:, None]              # [out_features, in_features]
         
+        x_min = x_deq.view(-1, x.size(-1)).min(dim=0).values  # [in_features]
+        x_max = x_deq.view(-1, x.size(-1)).max(dim=0).values  # [in_features]
+        if timestep not in self.act_stats:
+            self.act_stats[timestep] = {
+                'min': x_min.clone(),
+                'max': x_max.clone()
+            }
+        else:
+            s = self.act_stats[timestep]
+            s['min'] = torch.min(s['min'], x_min)
+            s['max'] = torch.max(s['max'], x_max)
+        
         # 4) linear + bias
         # y = F.linear(x_deq, w_deq, bias=(self.bias.float() if self.bias is not None else None))
-        y = F.linear(x_deq.to(torch.bfloat16), w_deq.to(torch.bfloat16), bias=self.bias)
+        y = F.linear(x_deq.bfloat16(), w_deq.bfloat16(), bias=self.bias)
 
         # 5) cast back
         return y.to(self.dtype)
@@ -118,47 +145,46 @@ class FakeQuantLinear(nn.Module):
         for t in all_ts:
             stats = self.act_stats[t]
             max_t = stats['max']  # Tensor[in_features]
-            # # s_tar^t = min_d max_t[d]
-            # s_tar = max_t.min()
+            min_t = stats['min']  # Tensor[in_features]
+            
+            # s_tar^t = min_d max_t[d]
+            peaks_t = torch.max(max_t.abs(), min_t.abs())
+            s_tar = peaks_t.min()
 
             # print("s_tar", s_tar)
 
-            # # r_t[d] = max_t[d] / s_tar
-            # r_t = max_t / s_tar
-            # print("r_t", r_t)
-
-            min_t = stats['min']
-            # per-channel "peak" magnitude
-            peak_t = torch.max(min_t.abs(), max_t.abs())    # always ≥ 0
-            # peak_t = torch.max(max_t - min_t)
-            s_tar = peak_t.kthvalue(int(0.05*len(peak_t))).values.clamp(min=1e-6)   # still ≥ 0
-
-            print("s_tar", s_tar)
-
-            r_t    = peak_t / s_tar                          # ≥ 0 for all d
-
-            print("r_t", r_t)
-
+            # r_t[d] = max_t[d] / s_tar
+            r_t = peaks_t / s_tar
             # accumulate numerator & denom
-            numer += r_t * max_t
-            denom += max_t
+            numer += (r_t * peaks_t).cpu()
+            denom += (peaks_t).cpu()
+
+            # print("numer", numer)
+            # print("denom", denom)
 
         # joint r_s
         r_s = numer / denom
-        r_s = r_s.clamp(min=0.1, max=(self.R_trunc or 10.0))
-        self.r_s.copy_(r_s)
+        # clamp if R_trunc given
+        if self.R_trunc is not None:
+            r_s = torch.clamp(r_s, max=self.R_trunc)
+        r_s = torch.clamp(r_s, min=1, max=100.0)
+        self.r_s.data.copy_(r_s)
 
-        # r_s.copy_(self.r_s)
-        print("R_S", r_s)
+        # r_s.data.copy_(self.r_s.data)
+        # self.r_s.data.copy_(r_s.data.abs())
+        # r_s.data.copy_(self.r_s.data)
+
+        # print("r_s", r_s)
+        # print("self.r_s", self.r_s)
+
 
         # 2) reparameterize & quantize weight
         #    W' = W * r_s
-        self.register_buffer('weight_int', torch.zeros_like(self.weight, dtype=torch.int8))
         W_rep = self.weight.float() * r_s                  # [out, in]
         w_min = W_rep.min(dim=1).values                    # [out]
         w_max = W_rep.max(dim=1).values                    # [out]
         scale_w = (w_max - w_min) / (qmax - qmin)          # [out]
-        scale_w = torch.where(scale_w>0, scale_w, 1e-8)
+        # scale_w = torch.where(scale_w>0, scale_w, 1e-8)
         zp_w    = torch.clamp((qmin - w_min/scale_w).round(),
                               qmin, qmax).to(torch.int32)  # [out]
         
@@ -173,11 +199,11 @@ class FakeQuantLinear(nn.Module):
         # 3) compute per-timestep activation qparams on X^t / r_s
         for t in all_ts:
             stats = self.act_stats[t]
-            min_rep = stats['min'] / r_s
-            max_rep = stats['max'] / r_s
+            min_rep = stats['min'] / r_s.cuda()
+            max_rep = stats['max'] / r_s.cuda()
 
             scale_a = (max_rep - min_rep) / (qmax - qmin)
-            scale_a = torch.where(scale_a > 0, scale_a, torch.tensor(1e-8, device=scale_a.device))
+            # scale_a = torch.where(scale_a > 0, scale_a, torch.tensor(1e-8, device=scale_a.device))
             zp_a = torch.clamp((qmin - min_rep/scale_a).round(), qmin, qmax).to(torch.int32)
 
             self.act_qparams[t] = {
@@ -187,15 +213,3 @@ class FakeQuantLinear(nn.Module):
 
         # switch to inference
         self.collecting = False
-        del self.weight
-
-    def get_activation_qparams(self, timestep: int):
-        """Return (scale, zero_point) for a given timestep after freeze()."""
-        if timestep not in self.act_qparams:
-            raise KeyError(f"No activation qparams for timestep {timestep}.")
-        p = self.act_qparams[timestep]
-        return p['scale'], p['zero_point']
-
-    def __repr__(self):
-        return f"FakeQuantLinear(in_features={self.in_features}, out_features={self.out_features}, " \
-               f"bias={self.bias is not None}, dtype={self.dtype}, R_trunc={self.R_trunc})"
