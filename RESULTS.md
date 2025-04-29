@@ -1,0 +1,8 @@
+| Метод                                           | Итерация 1            | Итерация 2            | Итерация 3            | Итерация 4            | Референс              |
+|-------------------------------------------------|-----------------------|-----------------------|-----------------------|-----------------------|-----------------------|
+| **MinMax с учетом шага + смузинг**               | ![image1](output/final/output_1_2.png) | ![image2](output/final/output_2_2.png) | ![image3](output/final/output_3_2.png) | ![image4](output/final/output_4_2.png) | ![reference](output/final/output_0_2.png) |
+| **FID**                                          | 446.4260                  | 10.8972                  | 15.0077                  |  16.3370                  | —                     |
+| **MinMax с учетом шага без смузинга**            | ![image1](output/no_smoothing/output_1_2.png) | ![image2](output/no_smoothing/output_2_2.png) | ![image3](output/no_smoothing/output_3_2.png) | ![image4](output/no_smoothing/output_4_2.png) | ![reference](output/no_smoothing/output_0_2.png) |
+| **FID**                                          | 440.6032                  | 41.6173                  | 43.4600                  | 46.4667                  | —                     |
+| **MinMax без учета шага**                        | ![image1](output/ts_independent/output_1_2.png) | ![image2](output/ts_independent/output_2_2.png) | ![image3](output/ts_independent/output_3_2.png) | ![image4](output/ts_independent/output_4_2.png) | ![reference](output/ts_independent/output_0_2.png) |
+| **FID**                                          | 129.3493                  | 78.5075                 | 79.3386                 | 90.9714                 | —                     |
